@@ -1,0 +1,30 @@
+{
+  "name": "omp-samplers",
+  "version": "1.0.0",
+  "description": "Per-prompt sampler chain control for oh-my-pi backed by a local llama.cpp server, driven by dropdown menus.",
+  "homepage": "https://github.com/Hellisotherpeople/omp-samplers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hellisotherpeople/omp-samplers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hellisotherpeople/omp-samplers/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "pi",
+    "llama.cpp",
+    "llamacpp",
+    "sampler",
+    "sampling",
+    "extension",
+    "tui",
+    "llm"
+  ],
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
