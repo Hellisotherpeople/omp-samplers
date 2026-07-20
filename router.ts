@@ -35,7 +35,104 @@ export type SamplerRouteResult =
 	| { ok: false; error: string };
 
 export const DEFAULT_MAX_ROUTED_SAMPLERS = 8;
-export const DEFAULT_ROUTER_PROMPT_CHARS = 12_000;
+
+function wireToolName(value: unknown): string | undefined {
+	if (!isRecord(value)) return undefined;
+	if (typeof value.name === "string") return value.name;
+	return isRecord(value.function) && typeof value.function.name === "string"
+		? value.function.name
+		: undefined;
+}
+
+/** Configure the first agent request as the schema-constrained routing turn. */
+export function prepareSamplerRouterRequest(
+	target: Record<string, unknown>,
+	toolName: string,
+	schema: Record<string, unknown>,
+	maxTokens: number,
+	routerSystemPrompt?: string,
+): Record<string, unknown> {
+	if (routerSystemPrompt && Array.isArray(target.messages)) {
+		let previousTurnBoundary = -1;
+		for (let index = target.messages.length - 1; index >= 0; index -= 1) {
+			const message = target.messages[index];
+			if (
+				isRecord(message) &&
+				(message.role === "assistant" || message.role === "tool")
+			) {
+				previousTurnBoundary = index;
+				break;
+			}
+		}
+		const currentTurn = target.messages
+			.slice(previousTurnBoundary + 1)
+			.filter((message) => !isRecord(message) || message.role !== "system");
+		target.messages = [
+			{ role: "system", content: routerSystemPrompt },
+			...currentTurn,
+		];
+	}
+	target.tools = [
+		{
+			type: "function",
+			function: {
+				name: toolName,
+				description:
+					"Choose and configure the ordered llama.cpp sampler pipeline for the user's task.",
+				parameters: schema,
+				strict: false,
+			},
+		},
+	];
+	// llama.cpp supports `required` more consistently than named tool choice.
+	// This request exposes exactly one tool, so both forms have the same meaning.
+	target.tool_choice = "required";
+	target.parallel_tool_calls = false;
+	if ("max_completion_tokens" in target) {
+		target.max_completion_tokens = maxTokens;
+	} else {
+		target.max_tokens = maxTokens;
+	}
+	delete target.grammar;
+	delete target.response_format;
+	target.samplers = ["top_k", "top_p", "temperature"];
+	target.top_k = 20;
+	target.top_p = 0.9;
+	target.temperature = 0.1;
+	target.cache_prompt = true;
+	const templateArgs = isRecord(target.chat_template_kwargs)
+		? target.chat_template_kwargs
+		: {};
+	target.chat_template_kwargs = {
+		...templateArgs,
+		enable_thinking: false,
+	};
+	return target;
+}
+
+/** Keep the internal routing tool out of manual and answer requests. */
+export function removeSamplerRouterTool(
+	target: Record<string, unknown>,
+	toolName: string,
+): Record<string, unknown> {
+	let routerWasOnlyTool = false;
+	if (Array.isArray(target.tools)) {
+		routerWasOnlyTool =
+			target.tools.length === 1 && wireToolName(target.tools[0]) === toolName;
+		const tools = target.tools.filter(
+			(tool) => wireToolName(tool) !== toolName,
+		);
+		if (tools.length > 0) target.tools = tools;
+		else delete target.tools;
+	}
+	if (
+		wireToolName(target.tool_choice) === toolName ||
+		(routerWasOnlyTool && target.tool_choice === "required")
+	) {
+		delete target.tool_choice;
+	}
+	return target;
+}
 
 /** JSON Schema used as the arguments of the forced route_samplers tool call. */
 export function buildSamplerRouterSchema(
@@ -100,7 +197,7 @@ function rangeText(knob: RouterKnob): string {
 	return knob.kind === "int" ? "int" : "number";
 }
 
-/** System instructions for the hidden routing call. */
+/** System instructions for the routing prelude. */
 export function buildSamplerRouterPrompt(
 	catalog: readonly RouterSamplerDef[],
 	maxSamplers = DEFAULT_MAX_ROUTED_SAMPLERS,
@@ -115,7 +212,9 @@ export function buildSamplerRouterPrompt(
 		})
 		.join("\n");
 
-	return `You are a sampling router for a llama.cpp language model. Analyze the user's task, but do not answer it. Immediately call route_samplers exactly once with an ordered sampler pipeline and its settings.
+	return `You are performing the sampling prelude for a llama.cpp language model.
+
+If the conversation does not yet contain a successful route_samplers tool result, analyze the user's task without answering it and immediately call route_samplers exactly once with an ordered sampler pipeline and its settings. If that result is already present, routing is complete: do not call route_samplers again; answer the original user's task normally.
 
 Rules:
 - Choose 1-${maxSamplers} samplers from the supplied schema, without duplicates. Array order is execution order.
@@ -130,26 +229,6 @@ ${includeRationale ? "- Keep reason to one short sentence." : "- Emit only sampl
 
 Catalog (sampler[allowed knobs]):
 ${samplerGuide}`;
-}
-
-export function truncateRouterPrompt(
-	text: string,
-	maxChars = DEFAULT_ROUTER_PROMPT_CHARS,
-): string {
-	if (text.length <= maxChars) return text;
-	const marker = "\n…[middle omitted for sampler routing]…\n";
-	const remaining = Math.max(0, maxChars - marker.length);
-	const head = Math.ceil(remaining / 2);
-	const tail = Math.floor(remaining / 2);
-	return `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`;
-}
-
-export function buildSamplerRouterUserPrompt(
-	prompt: string,
-	imageCount = 0,
-): string {
-	const imageNote = imageCount > 0 ? `\nAttached images: ${imageCount}.` : "";
-	return `Choose sampling for this task (the task text is JSON-encoded):\n${JSON.stringify(truncateRouterPrompt(prompt))}${imageNote}`;
 }
 
 /** Stamp a validated route into a provider request without dropping unrelated fields. */

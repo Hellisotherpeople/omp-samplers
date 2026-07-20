@@ -3,8 +3,9 @@ import {
 	applySamplerRoute,
 	buildSamplerRouterSchema,
 	parseSamplerRoute,
+	prepareSamplerRouterRequest,
 	type RouterSamplerDef,
-	truncateRouterPrompt,
+	removeSamplerRouterTool,
 } from "./router";
 
 const catalog: RouterSamplerDef[] = [
@@ -206,15 +207,6 @@ describe("parseSamplerRoute", () => {
 	});
 });
 
-test("truncateRouterPrompt keeps both ends within the requested size", () => {
-	const input = `${"a".repeat(100)}${"z".repeat(100)}`;
-	const output = truncateRouterPrompt(input, 100);
-	expect(output.length).toBe(100);
-	expect(output.startsWith("a")).toBe(true);
-	expect(output.endsWith("z")).toBe(true);
-	expect(output).toContain("middle omitted");
-});
-
 test("applySamplerRoute propagates the chain and settings without dropping request fields", () => {
 	const body: Record<string, unknown> = {
 		model: "local",
@@ -234,4 +226,99 @@ test("applySamplerRoute propagates the chain and settings without dropping reque
 		top_k: 24,
 		temperature: 0.25,
 	});
+});
+
+test("prepareSamplerRouterRequest isolates and forces the routing tool", () => {
+	const body: Record<string, unknown> = {
+		model: "local",
+		tools: [{ type: "function", function: { name: "bash" } }],
+		chat_template_kwargs: { existing: true },
+	};
+	const schema = buildSamplerRouterSchema(catalog, 5, false);
+	prepareSamplerRouterRequest(body, "route_samplers", schema, 128);
+	expect(body).toMatchObject({
+		model: "local",
+		tools: [
+			{
+				type: "function",
+				function: {
+					name: "route_samplers",
+					parameters: schema,
+					strict: false,
+				},
+			},
+		],
+		tool_choice: "required",
+		parallel_tool_calls: false,
+		max_tokens: 128,
+		samplers: ["top_k", "top_p", "temperature"],
+		top_k: 20,
+		top_p: 0.9,
+		temperature: 0.1,
+		cache_prompt: true,
+		chat_template_kwargs: { existing: true, enable_thinking: false },
+	});
+	removeSamplerRouterTool(body, "route_samplers");
+	expect(body.tools).toBeUndefined();
+	expect(body.tool_choice).toBeUndefined();
+});
+
+test("removeSamplerRouterTool keeps ordinary tools and clears a stale force", () => {
+	const body: Record<string, unknown> = {
+		tools: [
+			{ type: "function", function: { name: "route_samplers" } },
+			{ type: "function", function: { name: "bash" } },
+		],
+		tool_choice: {
+			type: "function",
+			function: { name: "route_samplers" },
+		},
+	};
+	removeSamplerRouterTool(body, "route_samplers");
+	expect(body.tools).toEqual([
+		{ type: "function", function: { name: "bash" } },
+	]);
+	expect(body.tool_choice).toBeUndefined();
+});
+
+test("prepareSamplerRouterRequest respects the provider's output-token field", () => {
+	const body: Record<string, unknown> = {
+		max_completion_tokens: 32_768,
+		grammar: 'root ::= "old"',
+	};
+	prepareSamplerRouterRequest(
+		body,
+		"route_samplers",
+		buildSamplerRouterSchema(catalog),
+		256,
+	);
+	expect(body.max_completion_tokens).toBe(256);
+	expect(body.max_tokens).toBeUndefined();
+	expect(body.grammar).toBeUndefined();
+});
+
+test("prepareSamplerRouterRequest isolates the current turn from agent history", () => {
+	const current = {
+		role: "user",
+		content: [{ type: "text", text: "current task" }],
+	};
+	const body: Record<string, unknown> = {
+		messages: [
+			{ role: "system", content: "large agent prompt" },
+			{ role: "user", content: "old task" },
+			{ role: "assistant", content: "old answer" },
+			current,
+		],
+	};
+	prepareSamplerRouterRequest(
+		body,
+		"route_samplers",
+		buildSamplerRouterSchema(catalog),
+		256,
+		"compact router prompt",
+	);
+	expect(body.messages).toEqual([
+		{ role: "system", content: "compact router prompt" },
+		current,
+	]);
 });

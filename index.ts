@@ -2,15 +2,15 @@
  * Per-prompt sampler control for oh-my-pi + local llama.cpp (mink build).
  *
  * Supports both a hand-tuned profile and an automatic "sampling router". In
- * auto mode the active LLM first makes a hidden, schema-constrained tool call
- * that chooses, orders, and configures samplers for the prompt. That validated
- * route is then injected into every answer request in the agent run.
+ * auto mode the active LLM first makes a schema-constrained tool call that
+ * chooses, orders, and configures samplers for the prompt. That validated route
+ * is then injected into every answer request in the agent run.
  *
  * How it works: llama.cpp's OpenAI-compatible endpoint honors a per-request
- * `samplers` array and individual sampler params. omp's `before_agent_start`
- * event is awaited, so the routing call finishes before answer generation. Its
- * `before_provider_request` event then lets us stamp the selected profile into
- * the outgoing body before serialization.
+ * `samplers` array and individual sampler params. The first normal agent turn is
+ * forced to call the internal routing tool; the tool validates and stores the
+ * route. omp's `before_provider_request` event then stamps it into the follow-up
+ * answer body before serialization.
  *
  * Entry points (type `/` to see them):
  *   /samplers        - open the menu; `/samplers auto|manual|show` also works
@@ -26,7 +26,6 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { completeSimple } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -36,11 +35,12 @@ import {
 	applySamplerRoute,
 	buildSamplerRouterPrompt,
 	buildSamplerRouterSchema,
-	buildSamplerRouterUserPrompt,
 	DEFAULT_MAX_ROUTED_SAMPLERS,
 	parseSamplerRoute,
+	prepareSamplerRouterRequest,
 	type RouterKnob,
 	type RouterSamplerDef,
+	removeSamplerRouterTool,
 	type SamplerRoute,
 } from "./router";
 
@@ -430,12 +430,6 @@ const ROUTER_PROMPT_WITHOUT_RATIONALE = buildSamplerRouterPrompt(
 );
 const ROUTER_MAX_TOKENS_WITH_RATIONALE = 512;
 const ROUTER_MAX_TOKENS_WITHOUT_RATIONALE = 384;
-const ROUTER_TIMEOUT_MS = (() => {
-	const configured = Number(process.env.OMP_SAMPLERS_ROUTER_TIMEOUT_MS);
-	return Number.isFinite(configured) && configured >= 1_000
-		? Math.min(configured, 28_000)
-		: 25_000;
-})();
 const FORCE_AUTO = /^(1|true|yes)$/i.test(process.env.OMP_SAMPLERS_AUTO ?? "");
 
 // ---------------------------------------------------------------------------
@@ -580,6 +574,12 @@ let profile = loadProfile();
 let activeRoute: SamplerRoute | undefined;
 let lastRoute: SamplerRoute | undefined;
 let lastRouterError: string | undefined;
+let routerPending = false;
+let routerIncludeRationale = true;
+let routerStartedAt = 0;
+let pendingRouterUsage:
+	| { input: number; output: number; cacheRead: number }
+	| undefined;
 let lastRouterStats:
 	| { durationMs: number; input: number; output: number; cacheRead: number }
 	| undefined;
@@ -686,168 +686,212 @@ export default function (pi: ExtensionAPI): void {
 		chain: profile.chain.join(","),
 	});
 
-	async function chooseRoute(
-		prompt: string,
-		imageCount: number,
-		ctx: ExtensionContext,
-	): Promise<SamplerRoute> {
-		const model = ctx.model;
-		if (!model) throw new Error("no active model");
-		const startedAt = performance.now();
-		const includeRationale = profile.includeRationale;
-		const routerMaxTokens = includeRationale
-			? ROUTER_MAX_TOKENS_WITH_RATIONALE
-			: ROUTER_MAX_TOKENS_WITHOUT_RATIONALE;
-
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt: [
-					includeRationale
-						? ROUTER_PROMPT_WITH_RATIONALE
-						: ROUTER_PROMPT_WITHOUT_RATIONALE,
-				],
-				messages: [
+	const Type = pi.typebox.Type;
+	const routerToolParameters = Type.Object(
+		{
+			samplers: Type.Array(
+				Type.Object(
 					{
-						role: "user",
-						content: buildSamplerRouterUserPrompt(prompt, imageCount),
-						timestamp: Date.now(),
+						id: Type.String(),
+						values: Type.Optional(
+							Type.Array(Type.Union([Type.Number(), Type.Boolean()])),
+						),
 					},
-				],
-				tools: [
-					{
-						name: ROUTER_TOOL_NAME,
-						description:
-							"Choose and configure the ordered llama.cpp sampler pipeline for the user's task.",
-						parameters: includeRationale
-							? ROUTER_SCHEMA_WITH_RATIONALE
-							: ROUTER_SCHEMA_WITHOUT_RATIONALE,
-						strict: false,
-					},
-				],
-			},
-			{
-				apiKey: ctx.modelRegistry.resolver(
-					model,
-					ctx.sessionManager.getSessionId(),
+					{ additionalProperties: false },
 				),
-				cacheRetention: "long",
-				promptCacheKey: `omp-samplers-router-v2-${includeRationale ? "rationale" : "compact"}`,
-				maxTokens: routerMaxTokens,
-				disableReasoning: true,
-				toolChoice: { type: "function", name: ROUTER_TOOL_NAME },
-				signal: AbortSignal.timeout(ROUTER_TIMEOUT_MS),
-				cwd: ctx.cwd,
-				onPayload: (payload) => {
-					if (!payload || typeof payload !== "object") return;
-					const body = payload as Record<string, unknown>;
-					// The router itself uses a small, conservative fixed distribution.
-					// Its output cannot apply its own choice retroactively.
-					body.samplers = ["top_k", "top_p", "temperature"];
-					body.top_k = 20;
-					body.top_p = 0.9;
-					body.temperature = 0.1;
-					body.cache_prompt = true;
-					const templateArgs =
-						body.chat_template_kwargs &&
-						typeof body.chat_template_kwargs === "object"
-							? (body.chat_template_kwargs as Record<string, unknown>)
-							: {};
-					body.chat_template_kwargs = {
-						...templateArgs,
-						enable_thinking: false,
-					};
-					pi.logger.debug("sampler router request prepared", {
-						model: `${model.provider}/${model.id}`,
-						maxTokens: routerMaxTokens,
-						timeoutMs: ROUTER_TIMEOUT_MS,
-						includeRationale,
-					});
-				},
-			},
-		);
+				{ minItems: 1, maxItems: DEFAULT_MAX_ROUTED_SAMPLERS },
+			),
+			reason: Type.Optional(Type.String()),
+		},
+		{ additionalProperties: false },
+	);
 
-		if (response.stopReason === "error" || response.stopReason === "aborted") {
-			throw new Error(
-				response.errorMessage ?? `router stopped with ${response.stopReason}`,
-			);
-		}
-		const call = response.content.find(
-			(part) => part.type === "toolCall" && part.name === ROUTER_TOOL_NAME,
+	async function setRouterToolActive(enabled: boolean): Promise<void> {
+		const active = pi.getActiveTools();
+		const hasRouter = active.includes(ROUTER_TOOL_NAME);
+		if (enabled === hasRouter) return;
+		await pi.setActiveTools(
+			enabled
+				? [...active, ROUTER_TOOL_NAME]
+				: active.filter((name) => name !== ROUTER_TOOL_NAME),
 		);
-		if (!call || call.type !== "toolCall") {
-			throw new Error(
-				`model did not call ${ROUTER_TOOL_NAME} (stop reason: ${response.stopReason})`,
-			);
-		}
-		const parsed = parseSamplerRoute(
-			call.arguments,
-			CATALOG,
-			DEFAULT_MAX_ROUTED_SAMPLERS,
-			includeRationale,
-		);
-		if (!parsed.ok) throw new Error(parsed.error);
-		const durationMs = Math.round(performance.now() - startedAt);
+	}
+
+	function deactivateRouterTool(): void {
+		void setRouterToolActive(false).catch((error) => {
+			pi.logger.warn("could not deactivate sampler router tool", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
+
+	function finishRouterStats(): void {
 		lastRouterStats = {
-			durationMs,
-			input: response.usage.input,
-			output: response.usage.output,
-			cacheRead: response.usage.cacheRead,
+			durationMs: Math.round(performance.now() - routerStartedAt),
+			input: pendingRouterUsage?.input ?? 0,
+			output: pendingRouterUsage?.output ?? 0,
+			cacheRead: pendingRouterUsage?.cacheRead ?? 0,
 		};
 		pi.logger.debug("sampler router response parsed", {
 			...lastRouterStats,
 		});
-		return parsed.route;
 	}
 
-	pi.on("before_agent_start", async (event, ctx) => {
-		activeRoute = undefined;
-		if (!profile.enabled || !isAutoMode()) return;
-		if (!profile.applyToAllModels && !looksLikeLlama(ctx)) return;
+	pi.registerTool({
+		name: ROUTER_TOOL_NAME,
+		label: "Sampler Router",
+		description:
+			"Internal sampling prelude. Choose and configure the ordered llama.cpp sampler pipeline for the current task.",
+		parameters: routerToolParameters,
+		hidden: true,
+		defaultInactive: true,
+		loadMode: "essential",
+		approval: "read",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!routerPending || !profile.enabled || !isAutoMode()) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "No sampler routing prelude is active. Continue normally.",
+						},
+					],
+					isError: true,
+				};
+			}
 
-		lastRouterError = undefined;
-		lastRouterStats = undefined;
-		try {
-			ctx.ui.setStatus("samplers", "samplers: AUTO · choosing…");
-			const selected = await chooseRoute(
-				event.prompt,
-				event.images?.length ?? 0,
-				ctx,
+			const parsed = parseSamplerRoute(
+				params,
+				CATALOG,
+				DEFAULT_MAX_ROUTED_SAMPLERS,
+				routerIncludeRationale,
 			);
-			activeRoute = selected;
-			lastRoute = selected;
-			pi.logger.debug("sampler router selected", {
-				chain: selected.chain.join(","),
-				params: selected.params,
-				...(profile.includeRationale ? { reason: selected.reason } : {}),
-			});
-		} catch (error) {
-			lastRouterError = error instanceof Error ? error.message : String(error);
-			activeRoute = {
-				...manualRoute(),
-				reason: `Manual fallback: ${lastRouterError}`,
-			};
-			pi.logger.warn("sampler router failed; using manual fallback", {
-				error: lastRouterError,
-			});
-			try {
+			routerPending = false;
+			finishRouterStats();
+			await setRouterToolActive(false);
+
+			if (!parsed.ok) {
+				lastRouterError = parsed.error;
+				activeRoute = {
+					...manualRoute(),
+					reason: `Manual fallback: ${lastRouterError}`,
+				};
+				pi.logger.warn("sampler router returned an invalid route", {
+					error: lastRouterError,
+				});
 				ctx.ui.notify(
-					`Sampler router failed; using the manual fallback. ${lastRouterError}`,
+					`Sampler router returned an invalid route; using the manual fallback. ${lastRouterError}`,
 					"warning",
 				);
-			} catch {
-				/* no UI */
+				refreshStatus(ctx);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "SAMPLER_ROUTE_APPLIED: manual fallback. Routing is complete; now answer the original user's task.",
+						},
+					],
+				};
 			}
-		} finally {
+
+			activeRoute = parsed.route;
+			lastRoute = parsed.route;
+			lastRouterError = undefined;
+			pi.logger.debug("sampler router selected", {
+				chain: parsed.route.chain.join(","),
+				params: parsed.route.params,
+				...(routerIncludeRationale ? { reason: parsed.route.reason } : {}),
+			});
 			refreshStatus(ctx);
+			const reason =
+				routerIncludeRationale && parsed.route.reason
+					? ` Reason: ${parsed.route.reason}`
+					: "";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `SAMPLER_ROUTE_APPLIED: ${summarizeChain(parsed.route.chain, parsed.route.params)}.${reason} Routing is complete; now answer the original user's task.`,
+					},
+				],
+				details: {
+					chain: parsed.route.chain,
+					params: parsed.route.params,
+					reason: parsed.route.reason,
+				},
+			};
+		},
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		activeRoute = undefined;
+		routerPending = false;
+		pendingRouterUsage = undefined;
+		if (!profile.enabled || !isAutoMode()) {
+			await setRouterToolActive(false);
+			return;
 		}
+		if (!profile.applyToAllModels && !looksLikeLlama(ctx)) {
+			await setRouterToolActive(false);
+			return;
+		}
+
+		await setRouterToolActive(true);
+		routerPending = true;
+		routerIncludeRationale = profile.includeRationale;
+		routerStartedAt = performance.now();
+		lastRouterError = undefined;
+		lastRouterStats = undefined;
+		ctx.ui.setStatus("samplers", "samplers: AUTO · choosing…");
+	});
+
+	pi.on("message_end", (event) => {
+		if (!routerPending || event.message.role !== "assistant") return;
+		const message = event.message as typeof event.message & {
+			usage?: { input?: number; output?: number; cacheRead?: number };
+		};
+		const hasRouterCall = message.content.some(
+			(part) => part.type === "toolCall" && part.name === ROUTER_TOOL_NAME,
+		);
+		if (!hasRouterCall) return;
+		pendingRouterUsage = {
+			input: Number(message.usage?.input ?? 0),
+			output: Number(message.usage?.output ?? 0),
+			cacheRead: Number(message.usage?.cacheRead ?? 0),
+		};
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
-		if (!profile.enabled) return;
 		const body = event.payload as Record<string, unknown> | undefined;
 		if (!body || typeof body !== "object") return;
+		removeSamplerRouterTool(body, ROUTER_TOOL_NAME);
+		if (!profile.enabled) return body;
 		if (!profile.applyToAllModels && !looksLikeLlama(ctx)) return;
+		if (routerPending && isAutoMode()) {
+			const schema = routerIncludeRationale
+				? ROUTER_SCHEMA_WITH_RATIONALE
+				: ROUTER_SCHEMA_WITHOUT_RATIONALE;
+			const maxTokens = routerIncludeRationale
+				? ROUTER_MAX_TOKENS_WITH_RATIONALE
+				: ROUTER_MAX_TOKENS_WITHOUT_RATIONALE;
+			const routerPrompt = routerIncludeRationale
+				? ROUTER_PROMPT_WITH_RATIONALE
+				: ROUTER_PROMPT_WITHOUT_RATIONALE;
+			prepareSamplerRouterRequest(
+				body,
+				ROUTER_TOOL_NAME,
+				schema,
+				maxTokens,
+				`[omp-samplers routing prelude]\n${routerPrompt}`,
+			);
+			pi.logger.debug("sampler router request prepared", {
+				model: `${ctx.model?.provider}/${ctx.model?.id}`,
+				maxTokens,
+				timeoutMs: "agent-controlled",
+				includeRationale: routerIncludeRationale,
+			});
+			return body;
+		}
 
 		const selected = routeForRequest();
 		applySamplerRoute(body, selected);
@@ -856,7 +900,11 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_e, ctx) => refreshStatus(ctx));
 	pi.on("agent_end", async (event, ctx) => {
-		if (!event.willContinue) activeRoute = undefined;
+		if (!event.willContinue) {
+			activeRoute = undefined;
+			routerPending = false;
+			await setRouterToolActive(false);
+		}
 		refreshStatus(ctx);
 	});
 
@@ -864,14 +912,18 @@ export default function (pi: ExtensionAPI): void {
 	function activateManualMode(): void {
 		profile.mode = "manual";
 		activeRoute = undefined;
+		routerPending = false;
 		lastRouterError = undefined;
+		deactivateRouterTool();
 	}
 
 	function setAutoMode(enabled: boolean, ctx: ExtensionContext): void {
 		profile.mode = enabled ? "auto" : "manual";
 		profile.enabled = true;
 		activeRoute = undefined;
+		routerPending = false;
 		lastRouterError = undefined;
+		if (!enabled) deactivateRouterTool();
 		save();
 		refreshStatus(ctx);
 	}
@@ -1156,14 +1208,20 @@ export default function (pi: ExtensionAPI): void {
 					ctx.ui.notify(detailedSummary(), "info");
 				} else if (choice === TOGGLE) {
 					profile.enabled = !profile.enabled;
+					if (!profile.enabled) {
+						routerPending = false;
+						deactivateRouterTool();
+					}
 					save();
 					refreshStatus(ctx);
 				} else if (choice === RESET) {
 					profile = defaultProfile();
 					activeRoute = undefined;
+					routerPending = false;
 					lastRoute = undefined;
 					lastRouterError = undefined;
 					lastRouterStats = undefined;
+					deactivateRouterTool();
 					save();
 					refreshStatus(ctx);
 					ctx.ui.notify(`Reset. ${summarize()}`, "info");
@@ -1285,6 +1343,10 @@ export default function (pi: ExtensionAPI): void {
 		description: "Toggle the sampler override on/off (off = server defaults)",
 		handler: async (_args: string, ctx: ExtensionCommandContext) => {
 			profile.enabled = !profile.enabled;
+			if (!profile.enabled) {
+				routerPending = false;
+				deactivateRouterTool();
+			}
 			save();
 			refreshStatus(ctx);
 			ctx.ui.notify(

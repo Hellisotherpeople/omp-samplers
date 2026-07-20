@@ -1,6 +1,6 @@
 {
   "name": "omp-samplers",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Manual and model-selected per-prompt llama.cpp sampler routing for oh-my-pi.",
   "homepage": "https://github.com/Hellisotherpeople/omp-samplers",
   "repository": {
