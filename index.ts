@@ -859,6 +859,16 @@ export default function (pi: ExtensionAPI): void {
 			output: Number(message.usage?.output ?? 0),
 			cacheRead: Number(message.usage?.cacheRead ?? 0),
 		};
+		const content = message.content as Array<(typeof message.content)[number]>;
+		const routeCalls = content.filter(
+			(part) => part.type === "toolCall" && part.name === ROUTER_TOOL_NAME,
+		);
+		if (routeCalls.length !== content.length) {
+			pi.logger.warn("discarding content emitted before sampler route", {
+				blocksDiscarded: content.length - routeCalls.length,
+			});
+			content.splice(0, content.length, ...routeCalls);
+		}
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {

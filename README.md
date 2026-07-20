@@ -13,7 +13,7 @@ Manual mode subscribes to omp's `before_provider_request` event and writes the a
 Auto mode adds a routing prelude to the normal agent loop:
 
 1. `before_agent_start` quickly activates the internal `route_samplers` tool and initializes routing state; it never waits for a model call.
-2. The first provider request contains only the static sampler guidance, current user turn, and that one forced tool. The normal agent context remains intact for the answer.
+2. The first provider request contains only the static sampler guidance, an extension-authored envelope holding the current task as inert JSON data, and that one forced tool. The raw task is never presented as an instruction to answer during routing; the normal agent context remains intact for the answer.
 3. The compact tool schema contains every sampler ID and positional values. Its array order is execution order; a compact catalog maps those values to each sampler's knobs, and the local validator enforces types, bounds, and ownership. An optional one-sentence rationale can be removed from the schema entirely.
 4. The tool validates and stores the route, then omp's normal tool follow-up becomes the answer request. Every token of that answer—and every later tool follow-up in the run—uses the selected route.
 
@@ -72,7 +72,7 @@ The router is deliberately conservative about structured output:
 - It must choose between one and eight unique samplers.
 - Sampler order and configuration are emitted together, preventing knobs from being attached to the wrong sampler.
 - Numeric choices are schema-bounded; manual mode remains available for experiments outside those bounds.
-- The router request itself uses fixed `top_k → top_p → temperature` sampling at temperature 0.1 and has thinking disabled. A route cannot apply to the tokens that generate that same route.
+- The router request itself uses greedy `top_k=1 → temperature=0` sampling and has thinking disabled. A route cannot apply to the tokens that generate that same route.
 - User text is treated as classification input, not as authority to disable the schema or skip routing.
 
 Auto mode adds one model inference and its latency to each top-level prompt. The internal tool turn reports the selected route, while the footer and `/samplers show` retain it afterward. Turning rationale off removes that field from both the provider schema and generated output; it saves decoding time, though the sampler configuration itself still has to be generated.
